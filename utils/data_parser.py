@@ -840,3 +840,213 @@ def list_episodes(data: dict):
                 i['media_path'] = i['stream_url']
 
     return episodes
+
+
+# ──────────────────────────────────────────────────────────
+#  飞牛影视 (Feiniu TV) 数据解析
+# ──────────────────────────────────────────────────────────
+
+def parse_received_data_fntv(received_data):
+    """解析油猴脚本发送的飞牛影视播放数据, 返回标准化 dict"""
+    data = received_data.copy()
+    data['server'] = 'fntv'
+    data['mount_disk_mode'] = False
+
+    subtitle_streams = data.get('subtitle_streams', [])
+    sub_guid = data.get('subtitle_guid', '')
+    sub_file = None
+    sub_index = -1
+
+    if sub_guid:
+        sub_file = f"{data['host']}/v/api/v1/subtitle/dl/{sub_guid}"
+        for i, s in enumerate(subtitle_streams):
+            if s['guid'] == sub_guid:
+                sub_index = s.get('index', i)
+                if not s.get('is_external', 1):
+                    sub_file = None  # 内封字幕由播放器处理
+                break
+
+    data['sub_file'] = sub_file
+    data['sub_index'] = sub_index
+
+    title = data.get('title', '')
+    filename = data.get('file_name', '')
+    tv_title = data.get('tv_title', '')
+    season_num = data.get('season_number', 0)
+    ep_num = data.get('episode_number', 0)
+    item_type = data.get('type', '')
+
+    if item_type == 'Episode' and tv_title:
+        media_title = f"{tv_title} S{season_num}:E{ep_num} - {title}  |  {filename}"
+    elif item_type == 'Movie':
+        media_title = f"{title}  |  {filename}" if title else filename
+    else:
+        media_title = filename
+
+    data['media_title'] = media_title
+    data['basename'] = filename
+    data['media_basename'] = filename
+    data['media_path'] = None
+    data['stream_url'] = None
+    data['item_id'] = data.get('item_guid', '')
+    data['index'] = ep_num
+
+    host = data.get('host', '')
+    data['netloc'] = host.replace('https://', '').replace('http://', '')
+    data['scheme'] = 'https' if host.startswith('https://') else 'http'
+
+    return data
+
+
+def list_episodes_fntv(data):
+    """获取飞牛影视的剧集列表 (基础信息, 不含流详情)
+
+    返回每集的基础信息: item_guid, title, season/episode_number, duration 等。
+    流详情 (media_guid, subtitles 等) 由调用方按需获取。
+    """
+    from utils.fntv_api import FntvApi
+
+    type_ = data.get('type', '')
+    if type_ == 'Movie':
+        return [data]
+
+    api = FntvApi(
+        host=data['host'],
+        token=data['token'],
+        http_proxy=configs.script_proxy,
+    )
+
+    parent_guid = data.get('parent_guid', '')
+    if not parent_guid:
+        item_guid = data.get('item_guid', '')
+        if item_guid:
+            item_data = api.get_item(item_guid)
+            if item_data:
+                parent_guid = item_data.get('parent_guid', '')
+
+    if not parent_guid:
+        logger.info('fntv list_episodes: no parent_guid, fallback to single ep')
+        return [data]
+
+    episodes_raw = api.get_episode_list(parent_guid) or []
+    if not episodes_raw:
+        logger.info('fntv list_episodes: empty episode list')
+        return [data]
+
+    logger.info(f'fntv list_episodes: found {len(episodes_raw)} episodes')
+
+    tv_title = data.get('tv_title', '')
+    parent_title = data.get('parent_title', '')
+    season_num = data.get('season_number', 0)
+    host = data['host']
+
+    episodes = []
+    for ep in episodes_raw:
+        guid = ep.get('guid', '')
+        ep_num = ep.get('episode_number', 0)
+        ep_title = ep.get('title', '')
+        duration = ep.get('duration', 0)
+        sn = ep.get('season_number', season_num)
+
+        if tv_title:
+            media_title = f"{tv_title} S{sn}:E{ep_num} - {ep_title}"
+        else:
+            media_title = ep_title
+
+        ep_data = dict(
+            server='fntv',
+            host=host,
+            token=data['token'],
+            scheme=data.get('scheme', 'https'),
+            netloc=data.get('netloc', ''),
+            item_guid=guid,
+            item_id=guid,
+            title=ep_title,
+            tv_title=tv_title,
+            parent_title=parent_title,
+            type='Episode',
+            season_number=sn,
+            episode_number=ep_num,
+            parent_guid=parent_guid,
+            total_sec=duration,
+            start_sec=0,
+            basename=ep_title,
+            media_basename=ep_title,
+            media_title=media_title,
+            media_path=None,
+            stream_url=None,
+            sub_file=None,
+            index=ep_num,
+            order=ep_num,
+            mount_disk_mode=False,
+            # 以下字段由调用方按需填充
+            media_guid='',
+            video_guid='',
+            audio_guid='',
+            subtitle_streams=[],
+            audio_streams=[],
+            video_streams=[],
+            file_path='',
+            file_name='',
+            file_size=0,
+            resolution='',
+            codec_name='',
+            bitrate=0,
+            subtitle_guid='',
+        )
+        episodes.append(ep_data)
+
+    return episodes
+
+
+def fetch_episode_stream_data(api, ep):
+    """按需获取单集的流信息 (media_guid, subtitles, file_path 等), 原地更新 ep 并返回"""
+    guid = ep.get('item_guid', '')
+    if not guid:
+        return ep
+
+    stream_data = {}
+    try:
+        stream_data = api.get_stream_list(guid) or {}
+    except Exception as e:
+        logger.error(f'fntv: stream/list failed for {guid}: {e}')
+        return ep
+
+    files = stream_data.get('files', [])
+    video_streams = stream_data.get('video_streams', [])
+    audio_streams = stream_data.get('audio_streams', [])
+    subtitle_streams = stream_data.get('subtitle_streams', [])
+
+    file_info = files[0] if files else {}
+    video_info = video_streams[0] if video_streams else {}
+    audio_info = audio_streams[0] if audio_streams else {}
+
+    ep['media_guid'] = file_info.get('guid', '')
+    ep['video_guid'] = video_info.get('guid', '')
+    ep['audio_guid'] = audio_info.get('guid', '') or ep.get('audio_guid', '')
+    ep['subtitle_streams'] = subtitle_streams
+    ep['audio_streams'] = audio_streams
+    ep['video_streams'] = video_streams
+    ep['file_path'] = file_info.get('path', '')
+    ep['file_name'] = file_info.get('file_name', ep.get('basename', ''))
+    ep['file_size'] = file_info.get('size', 0)
+    ep['resolution'] = video_info.get('resolution_type', '')
+    ep['codec_name'] = video_info.get('codec_name', '')
+    ep['bitrate'] = video_info.get('bps', 0)
+
+    tv_title = ep.get('tv_title', '')
+    sn = ep.get('season_number', 0)
+    ep_num = ep.get('episode_number', 0)
+    ep_title = ep.get('title', '')
+    basename = file_info.get('file_name', ep_title)
+    if tv_title:
+        ep['media_title'] = f"{tv_title} S{sn}:E{ep_num} - {ep_title}  |  {basename}"
+    else:
+        ep['media_title'] = f"{ep_title}  |  {basename}" if ep_title != basename else basename
+    ep['basename'] = basename
+    ep['media_basename'] = basename
+
+    if not ep.get('total_sec'):
+        ep['total_sec'] = video_info.get('duration', 0)
+
+    return ep

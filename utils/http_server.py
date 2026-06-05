@@ -4,6 +4,7 @@ import os
 import re
 import socket
 import subprocess
+import time
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
@@ -268,6 +269,22 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         return 0, file_size - 1
 
 
+def _fntv_subtitle_download(api, subtitle_guid, tmp_dir):
+    """下载飞牛字幕到本地文件, 返回路径"""
+    if not subtitle_guid:
+        return None
+    sub_content = api.download_subtitle(subtitle_guid)
+    if not sub_content:
+        return None
+    ext = '.srt' if sub_content.startswith(('1', '0', '[', '<')) else '.ass'
+    os.makedirs(tmp_dir, exist_ok=True)
+    sub_local = os.path.join(tmp_dir, f'fntv_sub_{subtitle_guid}{ext}')
+    with open(sub_local, 'w', encoding='utf-8') as f:
+        f.write(sub_content)
+    logger.info(f'fntv: subtitle -> {sub_local}')
+    return sub_local
+
+
 def start_play_fntv(data):
     """飞牛影视: 获取播放链接并启动本地播放器"""
     global player_is_running
@@ -408,6 +425,231 @@ def start_play_fntv(data):
 
     # Step 5: 播放器停止后将状态重置
     player_is_running = False
+
+
+def start_play_fntv(data):
+    """飞牛影视播放入口, mpv 原生播放列表"""
+    global player_is_running
+    from utils.fntv_api import FntvApi
+    from utils.data_parser import list_episodes_fntv
+
+    api = FntvApi(host=data['host'], token=data['token'], http_proxy=configs.script_proxy)
+    host = data['host']
+    token = data['token']
+    item_type = data.get('type', '')
+    item_guid = data.get('item_guid', '')
+    tmp_dir = os.path.join(configs.cwd, '.tmp')
+    os.makedirs(tmp_dir, exist_ok=True)
+    ep_meta_cache = {}  # title -> metadata dict
+
+    # ── 1. Ep list ──
+    if item_type == 'Movie':
+        eps_list, start_idx, first_ep = [data], 0, data
+    else:
+        eps_list = list_episodes_fntv(data) or [data]
+        start_idx = 0
+        for i, ep in enumerate(eps_list):
+            if ep.get('item_guid', '') == item_guid:
+                start_idx = i; break
+        first_ep = data  # userscript sent full data for first episode
+        logger.info(f'fntv: {len(eps_list)} eps, start={start_idx + 1}')
+
+    # ── 2. First ep: play_link + subtitle ──
+    mg = first_ep.get('media_guid', '')
+    vg = first_ep.get('video_guid', '')
+    ag = first_ep.get('audio_guid', '')
+    res = first_ep.get('resolution', '1080p')
+    br = first_ep.get('bitrate', 0)
+    codec = first_ep.get('codec_name', 'hevc')
+    start_sec = first_ep.get('start_sec', 0)
+    media_title = first_ep.get('media_title', first_ep.get('title', ''))
+    sub_streams = first_ep.get('subtitle_streams', [])
+
+    sguid = ''
+    for s in sub_streams:
+        if s.get('codec_name') in ('ass', 'subrip') and s.get('is_external', 0):
+            sguid = s.get('guid', ''); break
+    sub_local = _fntv_subtitle_download(api, sguid, tmp_dir) if sguid else None
+
+    pd = api.start_play(media_guid=mg, video_guid=vg, audio_guid=ag,
+                        video_encoder=codec, resolution=res, bitrate=br)
+    pl = pd.get('play_link', '')
+    if not pl:
+        logger.error('fntv: no play_link'); player_is_running = False; return
+    first_url = host.rstrip('/') + pl if not pl.startswith('http') else pl
+
+    # Cache first ep metadata for progress sync
+    ep_meta_cache[media_title] = dict(
+        idx=start_idx, item_guid=item_guid, media_guid=mg,
+        video_guid=vg, audio_guid=ag, resolution=res, bitrate=br,
+        total_sec=first_ep.get('total_sec', 0),
+        episode_number=first_ep.get('episode_number', start_idx + 1))
+
+    # ── 3. Launch mpv (NO --sub-file on cmdline — managed via IPC) ──
+    cmd = get_player_cmd(media_path=first_url, file_path=first_url, data=data)
+    pp = cmd[0]
+    if 'mpv' in pp.lower():
+        cmd.insert(1, f'--http-header-fields=Authorization: {token}')
+    logger.info(f'fntv: mpv ep {start_idx + 1}')
+
+    pnl = [i for i in list(start_player_func_dict) if i in pp.lower()]
+    if not pnl:
+        logger.error('fntv: mpv not found'); player_is_running = False; return
+
+    pn = pnl[0]
+    try:
+        skw = start_player_func_dict[pn](cmd=cmd, start_sec=start_sec, sub_file=None,
+                                           media_title=media_title, mount_disk_mode=False, data=data)
+    except Exception as e:
+        logger.error(f'fntv: start error: {e}'); player_is_running = False; return
+
+    mpv = skw.get('mpv')
+    t0 = time.time()
+
+    # Manage subtitles via IPC: all external subtitles loaded via sub-add/sub-remove
+    ep_sub_map = {}  # media_title -> local subtitle path
+
+    if mpv and sub_local:
+        ep_sub_map[media_title] = sub_local
+
+    if mpv:
+        # Wait a bit, then add first ep subtitle
+        if sub_local:
+            import time as _t
+            _t.sleep(0.8)
+            try:
+                mpv.command('sub-add', sub_local)
+                logger.info('fntv: sub added for ep 1')
+            except Exception as e:
+                logger.error(f'fntv: sub-add failed: {e}')
+
+        # file-loaded handler: swap subtitles when mpv changes episode
+        @mpv.on_event('file-loaded')
+        def on_file_loaded(_):
+            current_title = None
+            try:
+                current_title = mpv.command('get_property', 'media-title')
+                track_list = mpv.command('get_property', 'track-list') or []
+                for t in track_list:
+                    if t.get('type') == 'sub' and t.get('external'):
+                        mpv.command('sub-remove', t['id'])
+            except Exception:
+                pass
+            sub_path = ep_sub_map.get(current_title) if current_title else None
+            if sub_path:
+                try:
+                    mpv.command('sub-add', sub_path)
+                except Exception as e:
+                    logger.error(f'fntv: sub-add error: {e}')
+
+    # ── 4. Background: add remaining eps to mpv playlist ──
+    limit = configs.raw.getint('playlist', 'item_limit', fallback=-1)
+    if limit < 0: limit = len(eps_list)
+    remaining = [(i, eps_list[i]) for i in range(start_idx + 1, start_idx + limit) if i < len(eps_list)]
+
+    if mpv and remaining and not getattr(mpv, 'is_iina', False):
+        new_loadfile = False
+        try:
+            for c in mpv.command('get_property', 'command-list'):
+                if c['name'] == 'loadfile':
+                    for a in c['args']:
+                        if a['name'] == 'index': new_loadfile = True
+        except Exception: pass
+
+        if not new_loadfile:
+            logger.info('fntv: old mpv, playlist disabled')
+        else:
+            import concurrent.futures
+
+            def fetch_and_add(idx, ep):
+                guid = ep.get('item_guid', '')
+                if not guid: return
+                sd = api.get_stream_list(guid) or {}
+                fs = sd.get('files', [])
+                if not fs: return
+                vs = sd.get('video_streams', []); als = sd.get('audio_streams', [])
+                ss = sd.get('subtitle_streams', [])
+                fi = fs[0]; vi = vs[0] if vs else {}; ai = als[0] if als else {}
+                emg = fi['guid']; evg = vi.get('guid', ''); eag = ai.get('guid', '')
+                eres = vi.get('resolution_type', '1080p'); ebr = vi.get('bps', 0)
+                ecodec = vi.get('codec_name', 'hevc')
+
+                epd = api.start_play(media_guid=emg, video_guid=evg, audio_guid=eag,
+                                     video_encoder=ecodec, resolution=eres, bitrate=ebr)
+                epl = epd.get('play_link', '')
+                if not epl: return
+                esurl = host.rstrip('/') + epl if not epl.startswith('http') else epl
+
+                esguid = ''
+                for s in ss:
+                    if s.get('codec_name') in ('ass', 'subrip') and s.get('is_external', 0):
+                        esguid = s.get('guid', ''); break
+                esub = _fntv_subtitle_download(api, esguid, tmp_dir) if esguid else None
+
+                etitle = ep.get('media_title', ep.get('title', ''))
+                opts = f'force-media-title="{etitle}",osd-playing-msg="{etitle}",start=0'
+                if esub:
+                    ep_sub_map[etitle] = esub
+                try:
+                    mpv.command('loadfile', esurl, 'append', '-1', opts)
+                    logger.info(f'fntv: + ep {ep.get("episode_number", idx)}')
+                    ep_meta_cache[etitle] = dict(
+                        idx=idx, item_guid=guid, media_guid=emg, video_guid=evg,
+                        audio_guid=eag, resolution=eres, bitrate=ebr,
+                        total_sec=ep.get('total_sec', vi.get('duration', 0)),
+                        episode_number=ep.get('episode_number', 0))
+                except Exception as e:
+                    logger.error(f'fntv: add ep failed: {e}')
+
+            if len(remaining) <= 6:
+                for idx, ep in remaining: fetch_and_add(idx, ep)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+                    futures = [ex.submit(fetch_and_add, idx, ep) for idx, ep in remaining]
+                    concurrent.futures.wait(futures)
+
+    logger.info(f'fntv: playlist loaded in {time.time() - t0:.1f}s')
+
+    # ── 5. Wait for mpv exit ──
+    playlist_time = {}; playlist_total_sec = {}
+    if mpv:
+        result = stop_sec_func_dict[pn](**skw)
+        if isinstance(result, tuple):
+            playlist_time, playlist_total_sec = result
+        elif isinstance(result, dict):
+            playlist_time = result
+
+    # ── 6. Sync progress ──
+    if mpv and isinstance(playlist_time, dict):
+        sync_data = {media_title: first_ep}
+        for title, meta in ep_meta_cache.items():
+            idx = meta.get('idx', 0)
+            if idx < len(eps_list):
+                eps_list[idx].update({k: v for k, v in meta.items() if k != 'idx'})
+            sync_data[title] = eps_list[idx] if idx < len(eps_list) else meta
+
+        for ep_title, stop_sec in playlist_time.items():
+            if not stop_sec: continue
+            ep = sync_data.get(ep_title)
+            if not ep: continue
+            ts_sec = playlist_total_sec.get(ep_title, ep.get('total_sec', 0))
+            if ts_sec <= 0 or stop_sec / ts_sec < 0.01: continue
+            pct = stop_sec / ts_sec
+            logger.info(f'fntv: sync ep{ep.get("episode_number","?")} {int(stop_sec)}/{int(ts_sec)}s ({pct:.0%})')
+            api.record_progress(
+                item_guid=ep.get('item_guid', ''), media_guid=ep.get('media_guid', ''),
+                video_guid=ep.get('video_guid', ''), audio_guid=ep.get('audio_guid', ''),
+                resolution=ep.get('resolution', ''), bitrate=ep.get('bitrate', 0),
+                ts=int(stop_sec), duration=int(ts_sec), play_link='')
+
+    if sub_local:
+        try:
+            os.remove(sub_local)
+        except Exception:
+            pass
+    player_is_running = False
+    logger.info('fntv: done')
+
 
 
 def start_play(data):
