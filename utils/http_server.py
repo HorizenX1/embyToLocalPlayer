@@ -10,7 +10,8 @@ from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 from socketserver import ThreadingMixIn
 
-from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes
+from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes, \
+    parse_received_data_fntv, list_episodes_fntv
 from utils.downloader import DownloadManager
 from utils.net_tools import update_server_playback_progress, sync_third_party_for_eps
 from utils.player_manager import PlayerManager
@@ -78,6 +79,12 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             if configs.check_str_match(_str=data['netloc'], section='gui', option='except_host'):
                 threading.Thread(target=start_play, args=(data,), daemon=True).start()
                 return True
+        if 'fnvideo' in self.path:
+            self._post_resopne()
+            data = parse_received_data_fntv(data)
+            logger.info(f"server=fntv {data.get('type')} {data.get('item_guid')}")
+            threading.Thread(target=start_play_fntv, args=(data,), daemon=True).start()
+            return True
         thread_dict = {
             'play': threading.Thread(target=start_play, args=(data,)),
             'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
@@ -130,7 +137,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self._post_resopne({'msg': f'{self.path} not allow'})
 
     def do_OPTIONS(self):
-        pass
+        self._post_resopne()
 
     def do_GET(self):
         if self.path in ['/', '/favicon.ico']:
@@ -259,6 +266,148 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             end = int(end) if end else file_size - 1
             return start, end
         return 0, file_size - 1
+
+
+def start_play_fntv(data):
+    """飞牛影视: 获取播放链接并启动本地播放器"""
+    global player_is_running
+    from utils.fntv_api import FntvApi
+
+    api = FntvApi(
+        host=data['host'],
+        token=data['token'],
+        http_proxy=configs.script_proxy,
+    )
+
+    media_guid = data['media_guid']
+    video_guid = data['video_guid']
+    audio_guid = data['audio_guid']
+    subtitle_guid = data.get('subtitle_guid', '')
+    start_sec = data.get('start_sec', 0)
+    total_sec = data.get('total_sec', 0)
+    media_title = data.get('media_title', data.get('file_name', ''))
+    resolution = data.get('resolution', '1080p')
+    bitrate = data.get('bitrate', 0)
+    codec_name = data.get('codec_name', 'hevc')
+    host = data['host']
+    token = data['token']
+
+    logger.info(f'fntv: start play {media_title}, start_sec={start_sec}, total_sec={total_sec}')
+
+    # Step 1: 获取播放链接 (m3u8)
+    play_data = api.start_play(
+        media_guid=media_guid,
+        video_guid=video_guid,
+        audio_guid=audio_guid,
+        subtitle_guid=subtitle_guid,
+        video_encoder=codec_name,
+        resolution=resolution,
+        bitrate=bitrate,
+        start_timestamp=int(start_sec),
+    )
+
+    play_link = play_data.get('play_link', '')
+    if not play_link:
+        logger.error('fntv: failed to get play link')
+        return
+
+    stream_url = FntvApi.build_play_url(host, play_link)
+    data['stream_url'] = stream_url
+    data['media_path'] = stream_url
+
+    # Step 2: 下载外挂字幕到本地（飞牛API需要认证，mpv无法直接访问）
+    sub_file = data.get('sub_file')
+    if sub_file and sub_file.startswith('http'):
+        try:
+            import tempfile
+            subtitle_guid_dl = data.get('subtitle_guid', '')
+            if subtitle_guid_dl:
+                sub_content = api.download_subtitle(subtitle_guid_dl)
+                if sub_content:
+                    # 保存到临时文件
+                    ext = '.srt'
+                    for s in data.get('subtitle_streams', []):
+                        if s['guid'] == subtitle_guid_dl:
+                            fmt = s.get('format', 'srt')
+                            ext = f'.{fmt}' if fmt else '.srt'
+                            break
+                    tmp_dir = os.path.join(configs.cwd, '.tmp')
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    sub_local = os.path.join(tmp_dir, f'fntv_sub_{subtitle_guid_dl}{ext}')
+                    with open(sub_local, 'w', encoding='utf-8') as f:
+                        f.write(sub_content)
+                    sub_file = sub_local
+                    logger.info(f'fntv: subtitle downloaded to {sub_local}')
+        except Exception as e:
+            logger.error(f'fntv: subtitle download failed: {e}')
+            sub_file = None
+
+    # Step 3: 构建播放器命令
+    logger.info(f'fntv: stream_url={stream_url}')
+    cmd = get_player_cmd(media_path=stream_url, file_path=data.get('file_path', stream_url), data=data)
+    player_path = cmd[0]
+    player_path_lower = player_path.lower()
+
+    # 注入 HTTP header 认证（飞牛m3u8及其.ts分段需要认证）
+    if 'mpv' in player_path_lower or 'iina' in player_path_lower:
+        origin = host if host.startswith('http') else f'https://{host}'
+        http_headers = f'Authorization: {token}'
+        cmd.insert(1, f'--http-header-fields={http_headers}')
+        logger.info('fntv: added http-header-fields for mpv auth')
+
+    logger.info(f'fntv: cmd={" ".join(cmd)}')
+
+    # Step 4: 启动播放器
+    legal_player_name = list(start_player_func_dict)
+    player_name_list = [i for i in legal_player_name if i in player_path_lower]
+
+    if player_name_list:
+        player_name = player_name_list[0]
+        player_function = start_player_func_dict[player_name]
+        try:
+            stop_sec_kwargs = player_function(
+                cmd=cmd, start_sec=start_sec, sub_file=sub_file,
+                media_title=media_title, mount_disk_mode=False, data=data,
+            )
+            stop_sec = stop_sec_func_dict[player_name](**stop_sec_kwargs)
+        except Exception as e:
+            logger.error(f'fntv: player error: {e}')
+            player = subprocess.Popen(cmd)
+            player.wait()
+            stop_sec = None
+    else:
+        logger.info('fntv: run as generic player')
+        player = subprocess.Popen(cmd)
+        activate_window_by_pid(player.pid)
+        player.wait()
+        stop_sec = None
+
+    # Step 4: 回传播放进度
+    if stop_sec is not None and total_sec > 0:
+        # 如果播放器正常关闭并返回停止时间
+        progress = stop_sec / total_sec
+        logger.info(f'fntv: stop_sec={stop_sec}, progress={progress:.1%}')
+        if progress > 0.01:
+            # 只在有实际播放时才回传
+            api.record_progress(
+                item_guid=data['item_guid'],
+                media_guid=media_guid,
+                video_guid=video_guid,
+                audio_guid=audio_guid,
+                subtitle_guid=subtitle_guid,
+                resolution=resolution,
+                bitrate=bitrate,
+                ts=int(stop_sec),
+                duration=int(total_sec),
+                play_link=play_link,
+            )
+            logger.info(f'fntv: progress synced: {int(stop_sec)}/{int(total_sec)}s')
+    elif stop_sec is None and total_sec > 0:
+        # 播放器没有提供进度(比如播放器不支持 IPC, 或被直接关闭)
+        logger.info('fntv: no stop_sec from player, skipping progress sync')
+
+    # Step 5: 播放器停止后将状态重置
+    player_is_running = False
 
 
 def start_play(data):
